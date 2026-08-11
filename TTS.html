@@ -8,33 +8,54 @@
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; max-width: 650px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; background-color: #f4f6f8; color: #333; }
         .container { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); border: 1px solid #e1e4e8; }
         h1 { margin-top: 0; font-size: 1.75rem; color: #1a1a1a; }
-        button { cursor: pointer; padding: 12px 24px; font-size: 1rem; font-weight: 600; border: none; border-radius: 6px; margin-right: 10px; transition: opacity 0.2s; }
+        button { cursor: pointer; padding: 12px 20px; font-size: 1rem; font-weight: 600; border: none; border-radius: 6px; margin-right: 8px; margin-bottom: 8px; transition: opacity 0.2s; }
         button:disabled { opacity: 0.5; cursor: not-allowed; }
         #btn-record { background: #e74c3c; color: white; }
         #btn-stop { background: #2c3e50; color: white; display: none; }
+        #btn-clear { background: #95a5a6; color: white; }
+        #btn-copy { background: #3498db; color: white; }
         #status { margin-top: 1rem; font-size: 0.9rem; font-style: italic; color: #666; }
-        #output { margin-top: 1.5rem; padding: 1rem; border: 1px solid #ddd; background: #fafafa; min-height: 120px; max-height: 400px; overflow-y: auto; border-radius: 6px; }
-        .segment { margin-bottom: 0.5rem; display: flex; align-items: flex-start; }
-        .time { font-family: monospace; color: #3498db; font-weight: bold; min-width: 160px; shrink: 0; user-select: none; }
-        .text { color: #2c3e50; }
+        #output { margin-top: 1.5rem; width: 100%; box-sizing: border-box; padding: 1rem; border: 2px solid #ddd; background: #fafafa; min-height: 150px; border-radius: 6px; font-family: inherit; font-size: 1rem; line-height: 1.5; color: #2c3e50; resize: vertical; transition: border-color 0.2s, background 0.2s; }
+        #output:focus { outline: none; border-color: #3498db; }
+        #output.recording { border-color: #e74c3c; background: #fff5f5; }
         .loading-bar { width: 100%; height: 6px; background: #eee; margin-top: 12px; border-radius: 3px; overflow: hidden; display: none; }
         .progress { width: 0%; height: 100%; background: #2ecc71; transition: width 0.1s linear; }
+        .hints { font-size: 0.85rem; color: #888; margin-top: 0.5rem; }
+        .hints kbd { background: #eee; border: 1px solid #ccc; border-radius: 3px; padding: 1px 5px; font-family: monospace; font-size: 0.85em; }
+
+        /* Mic / transcribe state indicator */
+        #indicator { display: inline-flex; align-items: center; gap: 8px; margin-left: 6px; font-size: 0.9rem; font-weight: 600; vertical-align: middle; visibility: hidden; }
+        #indicator .dot { width: 12px; height: 12px; border-radius: 50%; }
+        #indicator.recording { visibility: visible; color: #e74c3c; }
+        #indicator.recording .dot { background: #e74c3c; animation: pulse 1s infinite; }
+        #indicator.busy { visibility: visible; color: #e67e22; }
+        #indicator.busy .dot { background: #e67e22; animation: pulse 0.5s infinite; }
+        @keyframes pulse { 0% { opacity: 1; transform: scale(1); } 50% { opacity: 0.35; transform: scale(1.3); } 100% { opacity: 1; transform: scale(1); } }
     </style>
 </head>
 <body>
 
 <div class="container">
-    <h1>Local Whisper STT (Web Worker)</h1>
+    <h1>Local Whisper STT (Web Worker)
+        <span id="indicator"><span class="dot"></span><span id="indicator-label"></span></span>
+    </h1>
     <p style="margin-top:-0.5rem; color:#666;">UI stays responsive during heavy neural computing.</p>
-    
+
     <div class="controls">
         <button id="btn-record" disabled>Spawning Worker...</button>
-        <button id="btn-stop">Stop & Transcribe</button>
+        <button id="btn-stop">Stop &amp; Transcribe</button>
+        <button id="btn-clear">Clear</button>
+        <button id="btn-copy">Copy</button>
+    </div>
+
+    <div class="hints">
+        Hold <kbd>Space</kbd> inside the text area to push-to-talk (a quick tap still types a space).
+        Press <kbd>R</kbd> outside the text area to start/stop recording.
     </div>
 
     <div id="loading-bar" class="loading-bar"><div id="progress" class="progress"></div></div>
     <div id="status">Initializing background thread...</div>
-    <div id="output"><em>Your transcript will appear here...</em></div>
+    <textarea id="output" placeholder="Your transcript will appear here... (editable)"></textarea>
 </div>
 
 <script type="module">
@@ -42,23 +63,43 @@
     let worker = null;
     let mediaRecorder = null;
     let audioChunks = [];
-    
+    let workerReady = false;
+    let isRecording = false;     // mic currently capturing
+    let isBusy = false;          // worker currently transcribing
+    let recordSource = null;     // 'button' | 'space' | 'key-r'
+    let spaceDownAt = 0;
+    let pendingAbort = false;    // released Space before the mic finished opening
+
+    const SPACE_TAP_MS = 250;    // shorter press = normal space character
+
     const btnRecord = document.getElementById('btn-record');
     const btnStop = document.getElementById('btn-stop');
+    const btnClear = document.getElementById('btn-clear');
+    const btnCopy = document.getElementById('btn-copy');
     const status = document.getElementById('status');
     const output = document.getElementById('output');
     const loadingBar = document.getElementById('loading-bar');
     const progressBar = document.getElementById('progress');
+    const indicator = document.getElementById('indicator');
+    const indicatorLabel = document.getElementById('indicator-label');
+
+    function setIndicator(state) {
+        indicator.className = state;
+        indicatorLabel.textContent = state === 'recording' ? 'MIC ON'
+                                   : state === 'busy' ? 'TRANSCRIBING' : '';
+        output.classList.toggle('recording', state === 'recording');
+        btnRecord.style.display = state === 'recording' ? 'none' : 'inline-block';
+        btnStop.style.display = state === 'recording' ? 'inline-block' : 'none';
+        btnRecord.disabled = !workerReady || state === 'busy';
+    }
 
     // 1. Spin up Web Worker
     function initWorker() {
         loadingBar.style.display = 'block';
         status.textContent = 'Spawning background thread...';
 
-        // Create the worker thread
         worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
 
-        // Listen for pipeline updates from worker
         worker.addEventListener('message', (event) => {
             const { type, data } = event.data;
 
@@ -66,22 +107,25 @@
                 progressBar.style.width = `${data}%`;
                 status.textContent = `Downloading architecture layers into worker cache: ${Math.round(data)}%`;
             }
-            
+
             if (type === 'ready') {
                 loadingBar.style.display = 'none';
-                status.textContent = 'Worker thread ready and cached. Click Record.';
-                btnRecord.disabled = false;
+                status.textContent = 'Worker thread ready and cached. Click Record, hold Space, or press R.';
+                workerReady = true;
                 btnRecord.textContent = 'Start Recording';
+                setIndicator('idle');
             }
 
             if (type === 'result') {
-                renderTranscript(data);
+                isBusy = false;
+                appendTranscript(data);
+                setIndicator('idle');
             }
 
             if (type === 'error') {
+                isBusy = false;
                 status.textContent = 'Worker Error: ' + data;
-                btnRecord.style.display = 'inline-block';
-                btnStop.style.display = 'none';
+                setIndicator('idle');
             }
         });
 
@@ -91,91 +135,158 @@
             status.textContent = 'Worker failed to start: ' + (event.message || 'see browser console');
         });
 
-        // Instruct worker to load the model pipeline
         worker.postMessage({ type: 'load' });
     }
 
     // 2. Capture Microphone Input
-    async function startRecording() {
+    async function startRecording(source) {
+        if (!workerReady || isRecording || isBusy) return;
+        isRecording = true;
+        recordSource = source;
+        pendingAbort = false;
         audioChunks = [];
+
         try {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+            // A quick Space tap may have ended before the mic finished opening
+            if (pendingAbort) {
+                stream.getTracks().forEach(track => track.stop());
+                isRecording = false;
+                recordSource = null;
+                setIndicator('idle');
+                return;
+            }
+
             mediaRecorder = new MediaRecorder(stream);
-            
+
             mediaRecorder.ondataavailable = (event) => {
                 audioChunks.push(event.data);
             };
 
             mediaRecorder.onstop = async () => {
+                stream.getTracks().forEach(track => track.stop());
+                if (pendingAbort || audioChunks.length === 0) {
+                    setIndicator('idle');
+                    status.textContent = 'Recording discarded.';
+                    return;
+                }
+
                 status.textContent = 'Decoding signals on main thread...';
-                const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
-                
-                // Decode to 16kHz Float32Array on main thread
+                isBusy = true;
+                setIndicator('busy');
+
+                const audioBlob = new Blob(audioChunks);
                 const arrayBuffer = await audioBlob.arrayBuffer();
                 const audioContext = new AudioContext({ sampleRate: 16000 });
                 const decodedAudio = await audioContext.decodeAudioData(arrayBuffer);
-                const audioData = decodedAudio.getChannelData(0); 
+                const audioData = decodedAudio.getChannelData(0);
 
                 status.textContent = 'Sending array buffers to Worker thread for computing...';
-                
-                // Pass raw audio buffer directly to worker
                 worker.postMessage({ type: 'transcribe', data: audioData });
-                
-                stream.getTracks().forEach(track => track.stop());
             };
 
             mediaRecorder.start();
             status.textContent = 'Recording input... Speak English or French.';
-            btnRecord.style.display = 'none';
-            btnStop.style.display = 'inline-block';
+            setIndicator('recording');
         } catch (err) {
+            isRecording = false;
+            recordSource = null;
+            setIndicator('idle');
             alert('Mic permission denied: ' + err.message);
         }
     }
 
-    // Helpers to parse timestamps safely
-    function formatTime(seconds) {
-        if (seconds === null || seconds === undefined) return "??:??";
-        const m = Math.floor(seconds / 60).toString().padStart(2, '0');
-        const s = Math.floor(seconds % 60).toString().padStart(2, '0');
-        const c = Math.floor((seconds % 1) * 100).toString().padStart(2, '0');
-        return `${m}:${s}.${c}`;
-    }
+    function stopRecording({ discard = false } = {}) {
+        if (!isRecording) return;
+        isRecording = false;
+        recordSource = null;
+        if (discard) pendingAbort = true;
 
-    function renderTranscript(result) {
-        output.innerHTML = '';
-        if (result.chunks && result.chunks.length > 0) {
-            result.chunks.forEach(chunk => {
-                const segDiv = document.createElement('div');
-                segDiv.className = 'segment';
-                
-                const timeSpan = document.createElement('span');
-                timeSpan.className = 'time';
-                
-                // Safeguard against missing or undefined array properties
-                const start = chunk.timestamp?.[0] ?? 0;
-                const end = chunk.timestamp?.[1] ?? start;
-                
-                timeSpan.textContent = `[${formatTime(start)} -> ${formatTime(end)}]`;
-                
-                const textSpan = document.createElement('span');
-                textSpan.className = 'text';
-                textSpan.textContent = ` ${chunk.text}`;
-                
-                segDiv.appendChild(timeSpan);
-                segDiv.appendChild(textSpan);
-                output.appendChild(segDiv);
-            });
+        if (mediaRecorder && mediaRecorder.state === 'recording') {
+            mediaRecorder.stop();
         } else {
-            output.textContent = result.text || "No speech detected.";
+            // Mic not open yet (getUserMedia still pending): abort once it resolves
+            pendingAbort = true;
         }
-        status.textContent = 'Done.';
-        btnRecord.style.display = 'inline-block';
-        btnStop.style.display = 'none';
     }
 
-    btnRecord.addEventListener('click', startRecording);
-    btnStop.addEventListener('click', () => mediaRecorder.stop());
+    // 3. Transcript handling — append, never clear automatically
+    function appendTranscript(result) {
+        const text = (result.text || '').trim();
+        if (!text) {
+            status.textContent = 'No speech detected.';
+            return;
+        }
+        const existing = output.value;
+        output.value = existing
+            ? existing.replace(/\s+$/, '') + ' ' + text
+            : text;
+        status.textContent = 'Done. Recording appended.';
+    }
+
+    // 4. Keyboard controls
+    // Hold Space in the textarea = push-to-talk; quick tap = normal space
+    output.addEventListener('keydown', (e) => {
+        if (e.code !== 'Space') return;
+        if (isBusy) return;                       // let Space type normally while transcribing
+        if (isRecording && recordSource !== 'space') return; // R/button owns this recording
+        e.preventDefault();                       // don't insert spaces while push-to-talk
+        if (e.repeat || isRecording) return;
+        spaceDownAt = performance.now();
+        startRecording('space');
+    });
+
+    output.addEventListener('keyup', (e) => {
+        if (e.code !== 'Space' || recordSource !== 'space') return;
+        e.preventDefault();
+        const heldMs = performance.now() - spaceDownAt;
+        if (heldMs < SPACE_TAP_MS) {
+            stopRecording({ discard: true });
+            // Behave like a normal space press
+            const pos = output.selectionStart;
+            output.setRangeText(' ', pos, output.selectionEnd, 'end');
+        } else {
+            stopRecording();
+        }
+    });
+
+    // R toggles recording when focus is outside the textarea
+    document.addEventListener('keydown', (e) => {
+        if (e.key.toLowerCase() !== 'r') return;
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        const target = e.target;
+        if (target === output || target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return;
+        e.preventDefault();
+        if (isRecording) {
+            stopRecording();
+        } else {
+            startRecording('key-r');
+        }
+    });
+
+    // 5. Buttons
+    btnRecord.addEventListener('click', () => startRecording('button'));
+    btnStop.addEventListener('click', () => stopRecording());
+
+    btnClear.addEventListener('click', () => {
+        output.value = '';
+        status.textContent = 'Transcript cleared.';
+    });
+
+    btnCopy.addEventListener('click', async () => {
+        try {
+            await navigator.clipboard.writeText(output.value);
+            const original = btnCopy.textContent;
+            btnCopy.textContent = 'Copied!';
+            setTimeout(() => { btnCopy.textContent = original; }, 1200);
+        } catch (err) {
+            // Fallback for browsers without the async clipboard API
+            output.select();
+            document.execCommand('copy');
+            status.textContent = 'Copied to clipboard.';
+        }
+    });
 
     initWorker();
 </script>
