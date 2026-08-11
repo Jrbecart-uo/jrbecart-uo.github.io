@@ -85,6 +85,12 @@
             }
         });
 
+        // Surface worker crashes (e.g. failed imports) instead of hanging silently
+        worker.addEventListener('error', (event) => {
+            loadingBar.style.display = 'none';
+            status.textContent = 'Worker failed to start: ' + (event.message || 'see browser console');
+        });
+
         // Instruct worker to load the model pipeline
         worker.postMessage({ type: 'load' });
     }

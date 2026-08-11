@@ -1,5 +1,5 @@
 // worker.js
-import { pipeline, env } from 'https://jsdelivr.net';
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
 
 // Configure environment for strict caching
 env.allowLocalModels = false;
