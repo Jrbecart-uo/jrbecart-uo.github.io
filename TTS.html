@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Local Whisper STT (Web Worker)</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; max-width: 650px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; background-color: #f4f6f8; color: #333; }
+        .container { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); border: 1px solid #e1e4e8; }
+        h1 { margin-top: 0; font-size: 1.75rem; color: #1a1a1a; }
+        button { cursor: pointer; padding: 12px 24px; font-size: 1rem; font-weight: 600; border: none; border-radius: 6px; margin-right: 10px; transition: opacity 0.2s; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        #btn-record { background: #e74c3c; color: white; }
+        #btn-stop { background: #2c3e50; color: white; display: none; }
+        #status { margin-top: 1rem; font-size: 0.9rem; font-style: italic; color: #666; }
+        #output { margin-top: 1.5rem; padding: 1rem; border: 1px solid #ddd; background: #fafafa; min-height: 120px; max-height: 400px; overflow-y: auto; border-radius: 6px; }
+        .segment { margin-bottom: 0.5rem; display: flex; align-items: flex-start; }
+        .time { font-family: monospace; color: #3498db; font-weight: bold; min-width: 160px; shrink: 0; user-select: none; }
+        .text { color: #2c3e50; }
+        .loading-bar { width: 100%; height: 6px; background: #eee; margin-top: 12px; border-radius: 3px; overflow: hidden; display: none; }
+        .progress { width: 0%; height: 100%; background: #2ecc71; transition: width 0.1s linear; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>Local Whisper STT (Web Worker)</h1>
+    <p style="margin-top:-0.5rem; color:#666;">UI stays responsive during heavy neural computing.</p>
+    
+    <div class="controls">
+        <button id="btn-record" disabled>Spawning Worker...</button>
+        <button id="btn-stop">Stop & Transcribe</button>
+    </div>
+
+    <div id="loading-bar" class="loading-bar"><div id="progress" class="progress"></div></div>
+    <div id="status">Initializing background thread...</div>
+    <div id="output"><em>Your transcript will appear here...</em></div>
+</div>
+
+<script type="module">
+    // State variables
+    let worker = null;
+    let mediaRecorder = null;
+    let audioChunks = [];
+    
+    const btnRecord = document.getElementById('btn-record');
+    const btnStop = document.getElementById('btn-stop');
+    const status = document.getElementById('status');
+    const output = document.getElementById('output');
+    const loadingBar = document.getElementById('loading-bar');
+    const progressBar = document.getElementById('progress');
+
+    // 1. Spin up Web Worker
+    function initWorker() {
+        loadingBar.style.display = 'block';
+        status.textContent = 'Spawning background thread...';
+
+        // Create the worker thread
+        worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+
+        // Listen for pipeline updates from worker
+        worker.addEventListener('message', (event) => {
+            const { type, data } = event.data;
+
+            if (type === 'progress') {
+                progressBar.style.width = `${data}%`;
+                status.textContent = `Downloading architecture layers into worker cache: ${Math.round(data)}%`;
+            }
+            
+            if (type === 'ready') {
+                loadingBar.style.display = 'none';
+                status.textContent = 'Worker thread ready and cached. Click Record.';
+                btnRecord.disabled = false;
+                btnRecord.textContent = 'Start Recording';
+            }
+
+            if (type === 'result') {
+                renderTranscript(data);
+            }
+
+            if (type === 'error') {
+                status.textContent = 'Worker Error: ' + data;
+                btnRecord.style.display = 'inline-block';
+                btnStop.style.display = 'none';
+            }
+        });
+
+        // Instruct worker to load the model pipeline
+        worker.postMessage({ type: 'load' });
+    }
+
+    // 2. Capture Microphone Input
+    async function startRecording() {
+        audioChunks = [];
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            mediaRecorder = new MediaRecorder(stream);
+            
+            mediaRecorder.ondataavailable = (event) => {
+                audioChunks.push(event.data);
+            };
+
+            mediaRecorder.onstop = async () => {
+                status.textContent = 'Decoding signals on main thread...';
+                const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+                
+                // Decode to 16kHz Float32Array on main thread
+                const arrayBuffer = await audioBlob.arrayBuffer();
+                const audioContext = new AudioContext({ sampleRate: 16000 });
+                const decodedAudio = await audioContext.decodeAudioData(arrayBuffer);
+                const audioData = decodedAudio.getChannelData(0); 
+
+                status.textContent = 'Sending array buffers to Worker thread for computing...';
+                
+                // Pass raw audio buffer directly to worker
+                worker.postMessage({ type: 'transcribe', data: audioData });
+                
+                stream.getTracks().forEach(track => track.stop());
+            };
+
+            mediaRecorder.start();
+            status.textContent = 'Recording input... Speak English or French.';
+            btnRecord.style.display = 'none';
+            btnStop.style.display = 'inline-block';
+        } catch (err) {
+            alert('Mic permission denied: ' + err.message);
+        }
+    }
+
+    // Helpers to parse timestamps safely
+    function formatTime(seconds) {
+        if (seconds === null || seconds === undefined) return "??:??";
+        const m = Math.floor(seconds / 60).toString().padStart(2, '0');
+        const s = Math.floor(seconds % 60).toString().padStart(2, '0');
+        const c = Math.floor((seconds % 1) * 100).toString().padStart(2, '0');
+        return `${m}:${s}.${c}`;
+    }
+
+    function renderTranscript(result) {
+        output.innerHTML = '';
+        if (result.chunks && result.chunks.length > 0) {
+            result.chunks.forEach(chunk => {
+                const segDiv = document.createElement('div');
+                segDiv.className = 'segment';
+                
+                const timeSpan = document.createElement('span');
+                timeSpan.className = 'time';
+                
+                // Safeguard against missing or undefined array properties
+                const start = chunk.timestamp?.[0] ?? 0;
+                const end = chunk.timestamp?.[1] ?? start;
+                
+                timeSpan.textContent = `[${formatTime(start)} -> ${formatTime(end)}]`;
+                
+                const textSpan = document.createElement('span');
+                textSpan.className = 'text';
+                textSpan.textContent = ` ${chunk.text}`;
+                
+                segDiv.appendChild(timeSpan);
+                segDiv.appendChild(textSpan);
+                output.appendChild(segDiv);
+            });
+        } else {
+            output.textContent = result.text || "No speech detected.";
+        }
+        status.textContent = 'Done.';
+        btnRecord.style.display = 'inline-block';
+        btnStop.style.display = 'none';
+    }
+
+    btnRecord.addEventListener('click', startRecording);
+    btnStop.addEventListener('click', () => mediaRecorder.stop());
+
+    initWorker();
+</script>
+
+</body>
+</html>
