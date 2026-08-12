@@ -1,30 +1,46 @@
 // worker.js
-import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
-
-// Configure environment for strict caching
-env.allowLocalModels = false;
-env.useBrowserCache = true;
+import { pipeline } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0';
 
 let transcriber = null;
+let busy = false;
 
-// Listen for messages from the main UI thread
 self.addEventListener('message', async (event) => {
     const { type, data } = event.data;
 
     if (type === 'load') {
-        try {
-            transcriber = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny', {
-                progress_callback: (progressData) => {
-                    if (progressData.status === 'progress') {
-                        // Send download progress back to the main thread
-                        self.postMessage({ type: 'progress', data: progressData.progress });
-                    }
-                }
+        const model = data?.model || 'onnx-community/whisper-base';
+        const isTurbo = model.includes('large-v3-turbo');
+        transcriber = null;
+
+        const progress_callback = (p) => {
+            if (p.status === 'progress') {
+                self.postMessage({ type: 'progress', data: p.progress });
+            }
+        };
+
+        // Prefer WebGPU (much faster, enables live transcription); fall back to WASM
+        const hasWebGPU = !!(self.navigator?.gpu && await self.navigator.gpu.requestAdapter().catch(() => null));
+        const attempts = [];
+        if (hasWebGPU) {
+            attempts.push({
+                device: 'webgpu',
+                dtype: isTurbo ? 'q4f16' : { encoder_model: 'fp32', decoder_model_merged: 'q4' }
             });
-            self.postMessage({ type: 'ready' });
-        } catch (error) {
-            self.postMessage({ type: 'error', data: error.message });
         }
+        attempts.push({ device: 'wasm', dtype: 'q8' });
+
+        let lastError = null;
+        for (const opts of attempts) {
+            try {
+                transcriber = await pipeline('automatic-speech-recognition', model, { ...opts, progress_callback });
+                self.postMessage({ type: 'ready', data: { device: opts.device } });
+                return;
+            } catch (error) {
+                console.warn(`[worker] load failed on ${opts.device}:`, error);
+                lastError = error;
+            }
+        }
+        self.postMessage({ type: 'error', data: 'Model load failed: ' + (lastError?.message || lastError) });
     }
 
     if (type === 'transcribe') {
@@ -32,32 +48,41 @@ self.addEventListener('message', async (event) => {
             self.postMessage({ type: 'error', data: 'Model not initialized.' });
             return;
         }
+        // One inference at a time; drop overlapping live passes
+        if (busy) {
+            self.postMessage({ type: 'result', data: { skipped: true, interim: !!data.interim } });
+            return;
+        }
+        busy = true;
 
         try {
-            // Diagnostics: check the audio actually contains signal
-            let peak = 0;
-            for (let i = 0; i < data.length; i++) {
-                const v = Math.abs(data[i]);
-                if (v > peak) peak = v;
-            }
-            console.log(`[worker] transcribe: ${data.length} samples (${(data.length / 16000).toFixed(1)}s), peak amplitude ${peak.toFixed(4)}`);
-            if (peak < 0.001) {
-                self.postMessage({ type: 'error', data: 'Audio is silent (peak amplitude ~0). Check mic input device.' });
-                return;
+            const { audio, language, interim } = data;
+
+            if (!interim) {
+                let peak = 0;
+                for (let i = 0; i < audio.length; i++) {
+                    const v = Math.abs(audio[i]);
+                    if (v > peak) peak = v;
+                }
+                console.log(`[worker] final transcribe: ${(audio.length / 16000).toFixed(1)}s, peak ${peak.toFixed(4)}, lang ${language}`);
+                if (peak < 0.001) {
+                    self.postMessage({ type: 'error', data: 'Audio is silent (peak amplitude ~0). Check mic input device.' });
+                    return;
+                }
             }
 
-            const result = await transcriber(data, {
-                language: null, // Auto-detect English or French
+            const result = await transcriber(audio, {
+                language: language,       // forced 'en' or 'fr' — no auto-detect
                 task: 'transcribe',
                 chunk_length_s: 30,
-                stride_length_s: 5,
-                return_timestamps: true
+                stride_length_s: 5
             });
 
-            console.log('[worker] result:', result);
-            self.postMessage({ type: 'result', data: result });
+            self.postMessage({ type: 'result', data: { text: result.text, interim: !!interim } });
         } catch (error) {
             self.postMessage({ type: 'error', data: error.message });
+        } finally {
+            busy = false;
         }
     }
 });

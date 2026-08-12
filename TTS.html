@@ -20,6 +20,8 @@
         #output.recording { border-color: #e74c3c; background: #fff5f5; }
         .loading-bar { width: 100%; height: 6px; background: #eee; margin-top: 12px; border-radius: 3px; overflow: hidden; display: none; }
         .progress { width: 0%; height: 100%; background: #2ecc71; transition: width 0.1s linear; }
+        .settings { margin-top: 0.5rem; display: flex; gap: 1.5rem; flex-wrap: wrap; font-size: 0.9rem; color: #555; }
+        .settings select { padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 0.9rem; background: white; color: #333; }
         .hints { font-size: 0.85rem; color: #888; margin-top: 0.5rem; }
         .hints kbd { background: #eee; border: 1px solid #ccc; border-radius: 3px; padding: 1px 5px; font-family: monospace; font-size: 0.85em; }
 
@@ -39,18 +41,34 @@
     <h1>Local Whisper STT (Web Worker)
         <span id="indicator"><span class="dot"></span><span id="indicator-label"></span></span>
     </h1>
-    <p style="margin-top:-0.5rem; color:#666;">UI stays responsive during heavy neural computing.</p>
+    <p style="margin-top:-0.5rem; color:#666;">Live local transcription — audio never leaves your browser.</p>
 
     <div class="controls">
         <button id="btn-record" disabled>Spawning Worker...</button>
-        <button id="btn-stop">Stop &amp; Transcribe</button>
+        <button id="btn-stop">Stop</button>
         <button id="btn-clear">Clear</button>
         <button id="btn-copy">Copy</button>
+    </div>
+
+    <div class="settings">
+        <label>Language:
+            <select id="language-select">
+                <option value="en" selected>English</option>
+                <option value="fr">Français</option>
+            </select>
+        </label>
+        <label>Model:
+            <select id="model-select">
+                <option value="onnx-community/whisper-base" selected>whisper-base (fast)</option>
+                <option value="onnx-community/whisper-large-v3-turbo">whisper-large-v3-turbo (best)</option>
+            </select>
+        </label>
     </div>
 
     <div class="hints">
         Hold <kbd>Space</kbd> inside the text area to push-to-talk (a quick tap still types a space).
         Press <kbd>R</kbd> outside the text area to start/stop recording.
+        Text appears live while you speak; the final pass on Stop refines it.
     </div>
 
     <div id="loading-bar" class="loading-bar"><div id="progress" class="progress"></div></div>
@@ -65,12 +83,20 @@
     let audioChunks = [];
     let workerReady = false;
     let isRecording = false;     // mic currently capturing
-    let isBusy = false;          // worker currently transcribing
+    let isBusy = false;          // final transcription in progress
     let recordSource = null;     // 'button' | 'space' | 'key-r'
     let spaceDownAt = 0;
     let pendingAbort = false;    // released Space before the mic finished opening
+    let currentDevice = 'wasm';
+
+    // Live transcription state
+    let liveTimer = null;
+    let liveBusy = false;        // a live (interim) pass is in flight
+    let pendingFinalAudio = null;// final audio waiting for an in-flight live pass
+    let committedText = '';      // textarea content before this recording started
 
     const SPACE_TAP_MS = 250;    // shorter press = normal space character
+    const LIVE_INTERVAL_MS = 2000;
 
     const btnRecord = document.getElementById('btn-record');
     const btnStop = document.getElementById('btn-stop');
@@ -82,6 +108,8 @@
     const progressBar = document.getElementById('progress');
     const indicator = document.getElementById('indicator');
     const indicatorLabel = document.getElementById('indicator-label');
+    const languageSelect = document.getElementById('language-select');
+    const modelSelect = document.getElementById('model-select');
 
     function setIndicator(state) {
         indicator.className = state;
@@ -93,11 +121,14 @@
         btnRecord.disabled = !workerReady || state === 'busy';
     }
 
+    function joinText(a, b) {
+        const t = (b || '').trim();
+        if (!t) return a;
+        return a ? a.replace(/\s+$/, '') + ' ' + t : t;
+    }
+
     // 1. Spin up Web Worker
     function initWorker() {
-        loadingBar.style.display = 'block';
-        status.textContent = 'Spawning background thread...';
-
         worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
 
         worker.addEventListener('message', (event) => {
@@ -105,25 +136,30 @@
 
             if (type === 'progress') {
                 progressBar.style.width = `${data}%`;
-                status.textContent = `Downloading architecture layers into worker cache: ${Math.round(data)}%`;
+                status.textContent = `Downloading model: ${Math.round(data)}%`;
             }
 
             if (type === 'ready') {
+                currentDevice = data?.device || 'wasm';
                 loadingBar.style.display = 'none';
-                status.textContent = 'Worker thread ready and cached. Click Record, hold Space, or press R.';
                 workerReady = true;
                 btnRecord.textContent = 'Start Recording';
+                let msg = `Ready on ${currentDevice.toUpperCase()}. Click Record, hold Space, or press R.`;
+                if (currentDevice === 'wasm' && modelSelect.value.includes('turbo')) {
+                    msg += ' Warning: turbo without WebGPU will be slow.';
+                }
+                status.textContent = msg;
                 setIndicator('idle');
             }
 
             if (type === 'result') {
-                isBusy = false;
-                appendTranscript(data);
-                setIndicator('idle');
+                handleResult(data);
             }
 
             if (type === 'error') {
                 isBusy = false;
+                liveBusy = false;
+                pendingFinalAudio = null;
                 status.textContent = 'Worker Error: ' + data;
                 setIndicator('idle');
             }
@@ -135,16 +171,79 @@
             status.textContent = 'Worker failed to start: ' + (event.message || 'see browser console');
         });
 
-        worker.postMessage({ type: 'load' });
+        loadModel();
     }
 
-    // 2. Capture Microphone Input
+    function loadModel() {
+        workerReady = false;
+        btnRecord.disabled = true;
+        btnRecord.textContent = 'Loading model...';
+        loadingBar.style.display = 'block';
+        progressBar.style.width = '0%';
+        status.textContent = 'Loading model...';
+        worker.postMessage({ type: 'load', data: { model: modelSelect.value } });
+    }
+
+    function handleResult(data) {
+        const { text, interim, skipped } = data;
+
+        if (interim || skipped) {
+            liveBusy = false;
+            if (!skipped && isRecording) {
+                output.value = joinText(committedText, text);
+                status.textContent = `Live transcribing on ${currentDevice.toUpperCase()}...`;
+            }
+            // The recording ended while this live pass was running: send the final now
+            if (pendingFinalAudio) {
+                const audio = pendingFinalAudio;
+                pendingFinalAudio = null;
+                worker.postMessage({ type: 'transcribe', data: { audio, language: languageSelect.value, interim: false } });
+            }
+            return;
+        }
+
+        // Final result: replaces the interim text for this recording
+        isBusy = false;
+        output.value = joinText(committedText, text);
+        committedText = output.value;
+        status.textContent = 'Done. Recording appended.';
+        setIndicator('idle');
+    }
+
+    // 2. Audio decoding (shared by live ticks and final pass)
+    async function decodeChunks() {
+        const audioBlob = new Blob(audioChunks);
+        const arrayBuffer = await audioBlob.arrayBuffer();
+        const audioContext = new AudioContext({ sampleRate: 16000 });
+        try {
+            const decodedAudio = await audioContext.decodeAudioData(arrayBuffer);
+            return decodedAudio.getChannelData(0);
+        } finally {
+            audioContext.close();
+        }
+    }
+
+    async function liveTick() {
+        if (!isRecording || liveBusy || audioChunks.length === 0) return;
+        liveBusy = true;
+        try {
+            const audio = await decodeChunks();
+            if (!isRecording) { liveBusy = false; return; } // stopped while decoding; final pass owns it now
+            worker.postMessage({ type: 'transcribe', data: { audio, language: languageSelect.value, interim: true } });
+        } catch (err) {
+            // Partial container not decodable yet — retry on next tick
+            liveBusy = false;
+        }
+    }
+
+    // 3. Capture Microphone Input
     async function startRecording(source) {
         if (!workerReady || isRecording || isBusy) return;
         isRecording = true;
         recordSource = source;
         pendingAbort = false;
         audioChunks = [];
+        committedText = output.value;
 
         try {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -161,33 +260,32 @@
             mediaRecorder = new MediaRecorder(stream);
 
             mediaRecorder.ondataavailable = (event) => {
-                audioChunks.push(event.data);
+                if (event.data.size > 0) audioChunks.push(event.data);
             };
 
             mediaRecorder.onstop = async () => {
                 stream.getTracks().forEach(track => track.stop());
+                clearInterval(liveTimer);
+                liveTimer = null;
+
                 if (pendingAbort || audioChunks.length === 0) {
                     setIndicator('idle');
                     status.textContent = 'Recording discarded.';
                     return;
                 }
 
-                status.textContent = 'Decoding signals on main thread...';
+                status.textContent = 'Finalizing transcription...';
                 isBusy = true;
                 setIndicator('busy');
 
                 try {
-                    const audioBlob = new Blob(audioChunks);
-                    console.log(`[main] recorded blob: ${audioBlob.size} bytes, type "${audioChunks[0]?.type}"`);
-                    const arrayBuffer = await audioBlob.arrayBuffer();
-                    const audioContext = new AudioContext({ sampleRate: 16000 });
-                    const decodedAudio = await audioContext.decodeAudioData(arrayBuffer);
-                    const audioData = decodedAudio.getChannelData(0);
-                    console.log(`[main] decoded: ${decodedAudio.duration.toFixed(1)}s at ${decodedAudio.sampleRate}Hz`);
-                    audioContext.close();
-
-                    status.textContent = 'Sending array buffers to Worker thread for computing...';
-                    worker.postMessage({ type: 'transcribe', data: audioData });
+                    const audio = await decodeChunks();
+                    if (liveBusy) {
+                        // A live pass is still running in the worker; queue the final
+                        pendingFinalAudio = audio;
+                    } else {
+                        worker.postMessage({ type: 'transcribe', data: { audio, language: languageSelect.value, interim: false } });
+                    }
                 } catch (err) {
                     console.error('[main] audio decode failed:', err);
                     isBusy = false;
@@ -196,8 +294,9 @@
                 }
             };
 
-            mediaRecorder.start();
-            status.textContent = 'Recording input... Speak English or French.';
+            mediaRecorder.start(500); // timeslice so chunks accumulate for live passes
+            liveTimer = setInterval(liveTick, LIVE_INTERVAL_MS);
+            status.textContent = 'Recording... speak now.';
             setIndicator('recording');
         } catch (err) {
             isRecording = false;
@@ -219,20 +318,6 @@
             // Mic not open yet (getUserMedia still pending): abort once it resolves
             pendingAbort = true;
         }
-    }
-
-    // 3. Transcript handling — append, never clear automatically
-    function appendTranscript(result) {
-        const text = (result.text || '').trim();
-        if (!text) {
-            status.textContent = 'No speech detected.';
-            return;
-        }
-        const existing = output.value;
-        output.value = existing
-            ? existing.replace(/\s+$/, '') + ' ' + text
-            : text;
-        status.textContent = 'Done. Recording appended.';
     }
 
     // 4. Keyboard controls
@@ -275,12 +360,19 @@
         }
     });
 
-    // 5. Buttons
+    // 5. Buttons & settings
+    modelSelect.addEventListener('change', () => {
+        if (isRecording) stopRecording({ discard: true });
+        status.textContent = 'Switching model...';
+        loadModel();
+    });
+
     btnRecord.addEventListener('click', () => startRecording('button'));
     btnStop.addEventListener('click', () => stopRecording());
 
     btnClear.addEventListener('click', () => {
         output.value = '';
+        committedText = '';
         status.textContent = 'Transcript cleared.';
     });
 
