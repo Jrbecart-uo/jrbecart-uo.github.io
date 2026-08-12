@@ -71,12 +71,14 @@ self.addEventListener('message', async (event) => {
                 }
             }
 
+            const t0 = performance.now();
             const result = await transcriber(audio, {
                 language: language,       // forced 'en' or 'fr' — no auto-detect
                 task: 'transcribe',
                 chunk_length_s: 30,
                 stride_length_s: 5
             });
+            console.log(`[worker] ${interim ? 'live' : 'final'} pass: ${(audio.length / 16000).toFixed(1)}s audio in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
 
             self.postMessage({ type: 'result', data: { text: result.text, interim: !!interim } });
         } catch (error) {

@@ -25,6 +25,11 @@
         .hints { font-size: 0.85rem; color: #888; margin-top: 0.5rem; }
         .hints kbd { background: #eee; border: 1px solid #ccc; border-radius: 3px; padding: 1px 5px; font-family: monospace; font-size: 0.85em; }
 
+        /* Device badge (WEBGPU / WASM) */
+        #device-badge { display: none; vertical-align: middle; margin-left: 6px; padding: 3px 10px; border-radius: 12px; font-size: 0.75rem; font-weight: 700; letter-spacing: 0.5px; }
+        #device-badge.webgpu { display: inline-block; background: #eafaf1; color: #27ae60; border: 1px solid #2ecc71; }
+        #device-badge.wasm { display: inline-block; background: #fdf3e7; color: #e67e22; border: 1px solid #e67e22; }
+
         /* Mic / transcribe state indicator */
         #indicator { display: inline-flex; align-items: center; gap: 8px; margin-left: 6px; font-size: 0.9rem; font-weight: 600; vertical-align: middle; visibility: hidden; }
         #indicator .dot { width: 12px; height: 12px; border-radius: 50%; }
@@ -39,6 +44,7 @@
 
 <div class="container">
     <h1>Local Whisper STT (Web Worker)
+        <span id="device-badge"></span>
         <span id="indicator"><span class="dot"></span><span id="indicator-label"></span></span>
     </h1>
     <p style="margin-top:-0.5rem; color:#666;">Live local transcription — audio never leaves your browser.</p>
@@ -97,6 +103,8 @@
 
     const SPACE_TAP_MS = 250;    // shorter press = normal space character
     const LIVE_INTERVAL_MS = 2000;
+    const LIVE_WINDOW_S = 25;    // live passes only re-transcribe this much recent audio
+    let liveSliced = false;      // last live pass was windowed (shows only the tail)
 
     const btnRecord = document.getElementById('btn-record');
     const btnStop = document.getElementById('btn-stop');
@@ -141,6 +149,9 @@
 
             if (type === 'ready') {
                 currentDevice = data?.device || 'wasm';
+                const badge = document.getElementById('device-badge');
+                badge.className = currentDevice;
+                badge.textContent = currentDevice.toUpperCase();
                 loadingBar.style.display = 'none';
                 workerReady = true;
                 btnRecord.textContent = 'Start Recording';
@@ -190,7 +201,9 @@
         if (interim || skipped) {
             liveBusy = false;
             if (!skipped && isRecording) {
-                output.value = joinText(committedText, text);
+                // When windowed, the live view only shows the recent tail ("…" prefix);
+                // the final pass on Stop restores the full transcript.
+                output.value = joinText(committedText, (liveSliced ? '… ' : '') + (text || ''));
                 status.textContent = `Live transcribing on ${currentDevice.toUpperCase()}...`;
             }
             // The recording ended while this live pass was running: send the final now
@@ -227,8 +240,15 @@
         if (!isRecording || liveBusy || audioChunks.length === 0) return;
         liveBusy = true;
         try {
-            const audio = await decodeChunks();
+            let audio = await decodeChunks();
             if (!isRecording) { liveBusy = false; return; } // stopped while decoding; final pass owns it now
+
+            // Bound the cost of live passes: only re-transcribe the recent window.
+            // The final pass on Stop still covers the whole recording.
+            const windowSamples = LIVE_WINDOW_S * 16000;
+            liveSliced = audio.length > windowSamples;
+            if (liveSliced) audio = audio.slice(-windowSamples);
+
             worker.postMessage({ type: 'transcribe', data: { audio, language: languageSelect.value, interim: true } });
         } catch (err) {
             // Partial container not decodable yet — retry on next tick
