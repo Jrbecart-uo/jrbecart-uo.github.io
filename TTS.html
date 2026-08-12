@@ -103,7 +103,9 @@
 
     const SPACE_TAP_MS = 250;    // shorter press = normal space character
     const LIVE_INTERVAL_MS = 2000;
-    const LIVE_WINDOW_S = 25;    // live passes only re-transcribe this much recent audio
+    const LIVE_WINDOW_MIN_S = 4;
+    const LIVE_WINDOW_MAX_S = 25;
+    let liveWindowS = 10;        // adapts to measured inference speed
     let liveSliced = false;      // last live pass was windowed (shows only the tail)
 
     const btnRecord = document.getElementById('btn-record');
@@ -196,7 +198,7 @@
     }
 
     function handleResult(data) {
-        const { text, interim, skipped } = data;
+        const { text, interim, skipped, durationMs } = data;
 
         if (interim || skipped) {
             liveBusy = false;
@@ -204,7 +206,15 @@
                 // When windowed, the live view only shows the recent tail ("…" prefix);
                 // the final pass on Stop restores the full transcript.
                 output.value = joinText(committedText, (liveSliced ? '… ' : '') + (text || ''));
-                status.textContent = `Live transcribing on ${currentDevice.toUpperCase()}...`;
+
+                // Adapt window size to measured speed: passes must finish well
+                // within the tick interval or live updates stall.
+                if (durationMs > LIVE_INTERVAL_MS * 0.9) {
+                    liveWindowS = Math.max(LIVE_WINDOW_MIN_S, liveWindowS * 0.6);
+                } else if (durationMs < LIVE_INTERVAL_MS * 0.4) {
+                    liveWindowS = Math.min(LIVE_WINDOW_MAX_S, liveWindowS * 1.4);
+                }
+                status.textContent = `Live transcribing on ${currentDevice.toUpperCase()} (window ${liveWindowS.toFixed(0)}s, pass ${(durationMs / 1000).toFixed(1)}s)`;
             }
             // The recording ended while this live pass was running: send the final now
             if (pendingFinalAudio) {
@@ -245,7 +255,7 @@
 
             // Bound the cost of live passes: only re-transcribe the recent window.
             // The final pass on Stop still covers the whole recording.
-            const windowSamples = LIVE_WINDOW_S * 16000;
+            const windowSamples = Math.round(liveWindowS * 16000);
             liveSliced = audio.length > windowSamples;
             if (liveSliced) audio = audio.slice(-windowSamples);
 

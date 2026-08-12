@@ -78,9 +78,10 @@ self.addEventListener('message', async (event) => {
                 chunk_length_s: 30,
                 stride_length_s: 5
             });
-            console.log(`[worker] ${interim ? 'live' : 'final'} pass: ${(audio.length / 16000).toFixed(1)}s audio in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+            const durationMs = performance.now() - t0;
+            console.log(`[worker] ${interim ? 'live' : 'final'} pass: ${(audio.length / 16000).toFixed(1)}s audio in ${(durationMs / 1000).toFixed(1)}s`);
 
-            self.postMessage({ type: 'result', data: { text: result.text, interim: !!interim } });
+            self.postMessage({ type: 'result', data: { text: result.text, interim: !!interim, durationMs } });
         } catch (error) {
             self.postMessage({ type: 'error', data: error.message });
         } finally {
