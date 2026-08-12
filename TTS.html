@@ -176,14 +176,24 @@
                 isBusy = true;
                 setIndicator('busy');
 
-                const audioBlob = new Blob(audioChunks);
-                const arrayBuffer = await audioBlob.arrayBuffer();
-                const audioContext = new AudioContext({ sampleRate: 16000 });
-                const decodedAudio = await audioContext.decodeAudioData(arrayBuffer);
-                const audioData = decodedAudio.getChannelData(0);
+                try {
+                    const audioBlob = new Blob(audioChunks);
+                    console.log(`[main] recorded blob: ${audioBlob.size} bytes, type "${audioChunks[0]?.type}"`);
+                    const arrayBuffer = await audioBlob.arrayBuffer();
+                    const audioContext = new AudioContext({ sampleRate: 16000 });
+                    const decodedAudio = await audioContext.decodeAudioData(arrayBuffer);
+                    const audioData = decodedAudio.getChannelData(0);
+                    console.log(`[main] decoded: ${decodedAudio.duration.toFixed(1)}s at ${decodedAudio.sampleRate}Hz`);
+                    audioContext.close();
 
-                status.textContent = 'Sending array buffers to Worker thread for computing...';
-                worker.postMessage({ type: 'transcribe', data: audioData });
+                    status.textContent = 'Sending array buffers to Worker thread for computing...';
+                    worker.postMessage({ type: 'transcribe', data: audioData });
+                } catch (err) {
+                    console.error('[main] audio decode failed:', err);
+                    isBusy = false;
+                    setIndicator('idle');
+                    status.textContent = 'Audio decode failed: ' + err.message;
+                }
             };
 
             mediaRecorder.start();
