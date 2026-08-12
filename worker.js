@@ -6,16 +6,55 @@ if (env.backends?.onnx?.webgpu) {
     env.backends.onnx.webgpu.powerPreference = 'high-performance';
 }
 
-let transcriber = null;
+// Whisper pads every input to a 30s window, so each pass has a fixed cost
+// regardless of audio length. Live drafts therefore use the cheapest model;
+// the final pass on Stop uses the user-selected one.
+const LIVE_MODEL = 'onnx-community/whisper-tiny';
+
+let transcriber = null;      // user-selected model — final passes
+let liveTranscriber = null;  // whisper-tiny — live draft passes
 let busy = false;
+
+async function tryLoad(model, progress_callback) {
+    const isTurbo = model.includes('large-v3-turbo');
+
+    let adapter = null;
+    if (self.navigator?.gpu) {
+        adapter = await self.navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }).catch(() => null);
+        if (adapter?.info) {
+            console.log(`[worker] GPU adapter: vendor=${adapter.info.vendor} arch=${adapter.info.architecture} ${adapter.info.description || ''}`);
+        }
+    }
+
+    const attempts = [];
+    if (adapter) {
+        attempts.push({
+            device: 'webgpu',
+            dtype: isTurbo ? 'q4f16' : { encoder_model: 'fp32', decoder_model_merged: 'q4' }
+        });
+    }
+    attempts.push({ device: 'wasm', dtype: 'q8' });
+
+    let lastError = null;
+    for (const opts of attempts) {
+        try {
+            const pipe = await pipeline('automatic-speech-recognition', model, { ...opts, progress_callback });
+            return { pipe, device: opts.device };
+        } catch (error) {
+            console.warn(`[worker] ${model} load failed on ${opts.device}:`, error);
+            lastError = error;
+        }
+    }
+    throw lastError;
+}
 
 self.addEventListener('message', async (event) => {
     const { type, data } = event.data;
 
     if (type === 'load') {
         const model = data?.model || 'onnx-community/whisper-base';
-        const isTurbo = model.includes('large-v3-turbo');
         transcriber = null;
+        liveTranscriber = null;
 
         const progress_callback = (p) => {
             if (p.status === 'progress') {
@@ -23,36 +62,22 @@ self.addEventListener('message', async (event) => {
             }
         };
 
-        // Prefer WebGPU (much faster, enables live transcription); fall back to WASM
-        let adapter = null;
-        if (self.navigator?.gpu) {
-            adapter = await self.navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }).catch(() => null);
-            if (adapter?.info) {
-                console.log(`[worker] GPU adapter: vendor=${adapter.info.vendor} arch=${adapter.info.architecture} ${adapter.info.description || ''}`);
-            }
-        }
-        const hasWebGPU = !!adapter;
-        const attempts = [];
-        if (hasWebGPU) {
-            attempts.push({
-                device: 'webgpu',
-                dtype: isTurbo ? 'q4f16' : { encoder_model: 'fp32', decoder_model_merged: 'q4' }
-            });
-        }
-        attempts.push({ device: 'wasm', dtype: 'q8' });
+        try {
+            const main = await tryLoad(model, progress_callback);
+            transcriber = main.pipe;
 
-        let lastError = null;
-        for (const opts of attempts) {
-            try {
-                transcriber = await pipeline('automatic-speech-recognition', model, { ...opts, progress_callback });
-                self.postMessage({ type: 'ready', data: { device: opts.device } });
-                return;
-            } catch (error) {
-                console.warn(`[worker] load failed on ${opts.device}:`, error);
-                lastError = error;
+            if (model === LIVE_MODEL) {
+                liveTranscriber = transcriber;
+            } else {
+                // Small (~40 MB) and quick; loaded before 'ready' so live works immediately
+                const live = await tryLoad(LIVE_MODEL, progress_callback);
+                liveTranscriber = live.pipe;
             }
+
+            self.postMessage({ type: 'ready', data: { device: main.device } });
+        } catch (error) {
+            self.postMessage({ type: 'error', data: 'Model load failed: ' + (error?.message || error) });
         }
-        self.postMessage({ type: 'error', data: 'Model load failed: ' + (lastError?.message || lastError) });
     }
 
     if (type === 'transcribe') {
@@ -83,15 +108,17 @@ self.addEventListener('message', async (event) => {
                 }
             }
 
+            const pipe = (interim && liveTranscriber) ? liveTranscriber : transcriber;
+
             const t0 = performance.now();
-            const result = await transcriber(audio, {
+            const result = await pipe(audio, {
                 language: language,       // forced 'en' or 'fr' — no auto-detect
                 task: 'transcribe',
                 chunk_length_s: 30,
                 stride_length_s: 5
             });
             const durationMs = performance.now() - t0;
-            console.log(`[worker] ${interim ? 'live' : 'final'} pass: ${(audio.length / 16000).toFixed(1)}s audio in ${(durationMs / 1000).toFixed(1)}s`);
+            console.log(`[worker] ${interim ? 'live(tiny)' : 'final'} pass: ${(audio.length / 16000).toFixed(1)}s audio in ${(durationMs / 1000).toFixed(1)}s`);
 
             self.postMessage({ type: 'result', data: { text: result.text, interim: !!interim, durationMs } });
         } catch (error) {
