@@ -1,5 +1,10 @@
 // worker.js
-import { pipeline } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0';
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0';
+
+// On dual-GPU laptops, ask for the discrete GPU instead of the low-power one
+if (env.backends?.onnx?.webgpu) {
+    env.backends.onnx.webgpu.powerPreference = 'high-performance';
+}
 
 let transcriber = null;
 let busy = false;
@@ -19,7 +24,14 @@ self.addEventListener('message', async (event) => {
         };
 
         // Prefer WebGPU (much faster, enables live transcription); fall back to WASM
-        const hasWebGPU = !!(self.navigator?.gpu && await self.navigator.gpu.requestAdapter().catch(() => null));
+        let adapter = null;
+        if (self.navigator?.gpu) {
+            adapter = await self.navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }).catch(() => null);
+            if (adapter?.info) {
+                console.log(`[worker] GPU adapter: vendor=${adapter.info.vendor} arch=${adapter.info.architecture} ${adapter.info.description || ''}`);
+            }
+        }
+        const hasWebGPU = !!adapter;
         const attempts = [];
         if (hasWebGPU) {
             attempts.push({
