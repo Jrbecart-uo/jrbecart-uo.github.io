@@ -70,12 +70,19 @@
                 <option value="onnx-community/whisper-large-v3-turbo">whisper-large-v3-turbo (best)</option>
             </select>
         </label>
+        <label>Live engine:
+            <select id="engine-select">
+                <option value="vosk" selected>Vosk (streaming, local)</option>
+                <option value="webspeech">Web Speech (Chrome)</option>
+                <option value="whisper">Whisper draft (tiny)</option>
+            </select>
+        </label>
     </div>
 
     <div class="hints">
         Hold <kbd>Space</kbd> inside the text area to push-to-talk (a quick tap still types a space).
         Press <kbd>R</kbd> outside the text area to start/stop recording.
-        Live text is a fast draft (whisper-tiny); the final pass on Stop redoes it with the selected model.
+        Live text is a draft; the final pass on Stop redoes everything with the selected Whisper model.
     </div>
 
     <div id="loading-bar" class="loading-bar"><div id="progress" class="progress"></div></div>
@@ -83,6 +90,7 @@
     <textarea id="output" placeholder="Your transcript will appear here... (editable)"></textarea>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/vosk-browser@0.0.8/dist/vosk.js"></script>
 <script type="module">
     // State variables
     let worker = null;
@@ -96,7 +104,7 @@
     let pendingAbort = false;    // released Space before the mic finished opening
     let currentDevice = 'wasm';
 
-    // Live transcription state
+    // Whisper-draft live engine state
     let liveTimer = null;
     let liveBusy = false;        // a live (interim) pass is in flight
     let pendingFinalAudio = null;// final audio waiting for an in-flight live pass
@@ -121,6 +129,7 @@
     const indicatorLabel = document.getElementById('indicator-label');
     const languageSelect = document.getElementById('language-select');
     const modelSelect = document.getElementById('model-select');
+    const engineSelect = document.getElementById('engine-select');
 
     function setIndicator(state) {
         indicator.className = state;
@@ -138,7 +147,7 @@
         return a ? a.replace(/\s+$/, '') + ' ' + t : t;
     }
 
-    // 1. Spin up Web Worker
+    // 1. Whisper worker (final passes always; live drafts in 'whisper' engine mode)
     function initWorker() {
         worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
 
@@ -226,7 +235,7 @@
             return;
         }
 
-        // Final result: replaces the interim text for this recording
+        // Final result: replaces the live draft for this recording
         isBusy = false;
         output.value = joinText(committedText, text);
         committedText = output.value;
@@ -234,7 +243,7 @@
         setIndicator('idle');
     }
 
-    // 2. Audio decoding (shared by live ticks and final pass)
+    // 2. Audio decoding (shared by whisper live ticks and final pass)
     async function decodeChunks() {
         const audioBlob = new Blob(audioChunks);
         const arrayBuffer = await audioBlob.arrayBuffer();
@@ -255,7 +264,6 @@
             if (!isRecording) { liveBusy = false; return; } // stopped while decoding; final pass owns it now
 
             // Bound the cost of live passes: only re-transcribe the recent window.
-            // The final pass on Stop still covers the whole recording.
             const windowSamples = Math.round(liveWindowS * 16000);
             liveSliced = audio.length > windowSamples;
             if (liveSliced) audio = audio.slice(-windowSamples);
@@ -267,7 +275,147 @@
         }
     }
 
-    // 3. Capture Microphone Input
+    // 3. Vosk live engine — true streaming, fully local
+    // Model archives are split into <25 MB parts (GitHub web-upload limit) and
+    // reassembled in memory before being handed to Vosk as a blob URL.
+    const VOSK_MODELS = {
+        en: [
+            './models/vosk-model-small-en-us-0.15.tar.gz.00.part',
+            './models/vosk-model-small-en-us-0.15.tar.gz.01.part'
+        ],
+        fr: [
+            './models/vosk-model-small-fr-0.22.tar.gz.00.part',
+            './models/vosk-model-small-fr-0.22.tar.gz.01.part',
+            './models/vosk-model-small-fr-0.22.tar.gz.02.part'
+        ]
+    };
+    const voskModels = {};   // lang -> loaded model
+    let voskRecognizer = null;
+    let voskAudioCtx = null;
+    let voskSource = null;
+    let voskProcessor = null;
+    let voskFinalText = '';
+    let voskPartial = '';
+
+    async function getVoskModel(lang) {
+        if (!voskModels[lang]) {
+            status.textContent = `Loading Vosk ${lang.toUpperCase()} model...`;
+            const buffers = await Promise.all(VOSK_MODELS[lang].map(url =>
+                fetch(url).then(r => {
+                    if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+                    return r.arrayBuffer();
+                })
+            ));
+            const blobUrl = URL.createObjectURL(new Blob(buffers, { type: 'application/gzip' }));
+            try {
+                voskModels[lang] = await Vosk.createModel(blobUrl);
+            } finally {
+                URL.revokeObjectURL(blobUrl);
+            }
+        }
+        return voskModels[lang];
+    }
+
+    async function startVoskLive(stream) {
+        const model = await getVoskModel(languageSelect.value);
+        if (!isRecording) return;
+
+        voskFinalText = '';
+        voskPartial = '';
+        voskAudioCtx = new AudioContext();
+        voskRecognizer = new model.KaldiRecognizer(voskAudioCtx.sampleRate);
+        voskRecognizer.on('result', (message) => {
+            const t = message.result?.text;
+            if (t) voskFinalText = joinText(voskFinalText, t);
+            voskPartial = '';
+            renderVoskLive();
+        });
+        voskRecognizer.on('partialresult', (message) => {
+            voskPartial = message.result?.partial || '';
+            renderVoskLive();
+        });
+
+        voskSource = voskAudioCtx.createMediaStreamSource(stream);
+        voskProcessor = voskAudioCtx.createScriptProcessor(4096, 1, 1);
+        voskProcessor.onaudioprocess = (e) => {
+            try { voskRecognizer?.acceptWaveform(e.inputBuffer); } catch (err) { /* recognizer gone */ }
+        };
+        voskSource.connect(voskProcessor);
+        voskProcessor.connect(voskAudioCtx.destination);
+        status.textContent = 'Live transcribing with Vosk (local streaming)...';
+    }
+
+    function renderVoskLive() {
+        if (!isRecording) return;
+        output.value = joinText(committedText, joinText(voskFinalText, voskPartial));
+    }
+
+    function stopVoskLive() {
+        try { voskProcessor?.disconnect(); } catch (e) {}
+        try { voskSource?.disconnect(); } catch (e) {}
+        try { voskAudioCtx?.close(); } catch (e) {}
+        voskProcessor = null;
+        voskSource = null;
+        voskAudioCtx = null;
+        voskRecognizer = null;
+    }
+
+    // 4. Web Speech live engine — Chrome built-in (may use cloud if no on-device pack)
+    let speechRec = null;
+
+    async function startWebSpeechLive() {
+        const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SR) {
+            status.textContent = 'Web Speech API not supported in this browser — live preview disabled.';
+            return;
+        }
+        const lang = languageSelect.value === 'fr' ? 'fr-FR' : 'en-US';
+
+        speechRec = new SR();
+        speechRec.lang = lang;
+        speechRec.continuous = true;
+        speechRec.interimResults = true;
+
+        // Best effort: prefer on-device recognition when this Chrome supports it
+        let local = false;
+        try {
+            if (SR.available) {
+                const avail = await SR.available({ langs: [lang], processLocally: true });
+                if (avail === 'available') {
+                    speechRec.processLocally = true;
+                    local = true;
+                }
+            }
+        } catch (e) { /* older Chrome — plain (cloud) recognition */ }
+
+        speechRec.onresult = (e) => {
+            let fin = '', inter = '';
+            for (const r of e.results) {
+                if (r.isFinal) fin += r[0].transcript + ' ';
+                else inter += r[0].transcript;
+            }
+            if (isRecording) output.value = joinText(committedText, (fin + ' ' + inter).trim());
+        };
+        speechRec.onerror = (e) => {
+            if (e.error !== 'no-speech') status.textContent = 'Web Speech error: ' + e.error;
+        };
+        // Chrome stops recognition after silences; restart while still recording
+        speechRec.onend = () => {
+            if (isRecording && speechRec) { try { speechRec.start(); } catch (e) {} }
+        };
+        speechRec.start();
+        status.textContent = `Live transcribing with Web Speech (${local ? 'on-device' : 'may use Google cloud'})...`;
+    }
+
+    function stopWebSpeechLive() {
+        if (!speechRec) return;
+        const rec = speechRec;
+        speechRec = null;      // prevents onend from restarting it
+        rec.onend = null;
+        try { rec.stop(); } catch (e) {}
+    }
+
+    // 5. Capture Microphone Input
     async function startRecording(source) {
         if (!workerReady || isRecording || isBusy) return;
         isRecording = true;
@@ -298,6 +446,8 @@
                 stream.getTracks().forEach(track => track.stop());
                 clearInterval(liveTimer);
                 liveTimer = null;
+                stopVoskLive();
+                stopWebSpeechLive();
 
                 if (pendingAbort || audioChunks.length === 0) {
                     setIndicator('idle');
@@ -312,7 +462,7 @@
                 try {
                     const audio = await decodeChunks();
                     if (liveBusy) {
-                        // A live pass is still running in the worker; queue the final
+                        // A whisper live pass is still running in the worker; queue the final
                         pendingFinalAudio = audio;
                     } else {
                         worker.postMessage({ type: 'transcribe', data: { audio, language: languageSelect.value, interim: false } });
@@ -325,9 +475,18 @@
                 }
             };
 
-            mediaRecorder.start(500); // timeslice so chunks accumulate for live passes
-            liveTimer = setInterval(liveTick, LIVE_INTERVAL_MS);
-            status.textContent = 'Recording... speak now.';
+            mediaRecorder.start(500); // timeslice so chunks accumulate for whisper passes
+            const engine = engineSelect.value;
+            if (engine === 'whisper') {
+                liveTimer = setInterval(liveTick, LIVE_INTERVAL_MS);
+            } else if (engine === 'vosk') {
+                startVoskLive(stream).catch(err => {
+                    status.textContent = 'Vosk model load failed (' + err.message + ') — no live preview, final pass still works.';
+                });
+            } else if (engine === 'webspeech') {
+                startWebSpeechLive();
+            }
+            if (engine !== 'vosk') status.textContent = 'Recording... speak now.';
             setIndicator('recording');
         } catch (err) {
             isRecording = false;
@@ -351,7 +510,7 @@
         }
     }
 
-    // 4. Keyboard controls
+    // 6. Keyboard controls
     // Hold Space in the textarea = push-to-talk; quick tap = normal space
     output.addEventListener('keydown', (e) => {
         if (e.code !== 'Space') return;
@@ -391,11 +550,15 @@
         }
     });
 
-    // 5. Buttons & settings
+    // 7. Buttons & settings
     modelSelect.addEventListener('change', () => {
         if (isRecording) stopRecording({ discard: true });
         status.textContent = 'Switching model...';
         loadModel();
+    });
+
+    engineSelect.addEventListener('change', () => {
+        if (isRecording) stopRecording();
     });
 
     btnRecord.addEventListener('click', () => startRecording('button'));
